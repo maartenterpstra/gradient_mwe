@@ -1,25 +1,33 @@
 import os
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-import random
 import numpy as np
 import tensorflow
 import tensorflow as tf
 import tensorflow.keras.backend as K
+from tensorflow.signal import fft2d, ifft2d, ifftshift, fftshift
+import random
 K.set_image_data_format('channels_first')
-
+from keras_conv import ComplexConv2D
+import torch
 gpus = tf.config.experimental.list_physical_devices('GPU')
 for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True)
 tf.config.set_soft_device_placement(False)
-import torch
-torch.use_deterministic_algorithms(True)
-torch.backends.cudnn.deterministic = True
 random.seed(271828)
 np.random.seed(271828)
 torch.manual_seed(271828)
 tf.random.set_seed(271828)
-torch.set_printoptions(precision=10)
+
+
+
+class UnrolledNetwork(tf.keras.Model):
+    def __init__(self):
+        super().__init__()
+        self.layer = tf.keras.layers.Conv2D(filters=1, kernel_size=(3,3), padding="SAME", kernel_initializer=my_init, bias_initializer=tf.keras.initializers.Zeros())
+    def call(self, inputs):
+        return batch_crop_center(self.layer(inputs[0]), 320, 320)
+
 def batch_crop_center(img,cropx,cropy):
     # TODO: ugly hardcoded size
     y,x = 640, 368
@@ -27,6 +35,11 @@ def batch_crop_center(img,cropx,cropy):
     starty = y//2-(cropy//2)
     return img[:, :, starty:starty+cropy,startx:startx+cropx]
 
+def my_init(shape, dtype=None):
+    # old seed 42069
+    tf.random.set_seed(271828)
+    init = tf.keras.initializers.HeNormal(seed=271828)
+    return init(shape)
 
 class IFFT2c(torch.nn.Module):
     def forward(self, kspace, *args):
@@ -35,22 +48,6 @@ class IFFT2c(torch.nn.Module):
 def csm_reduce(x, csm):
     ifft2c = IFFT2c()
     return (ifft2c(x) * torch.conj(csm)).sum(1, keepdims=True)
-
-class ComplexMSELoss(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.mse = torch.nn.MSELoss()
-        
-    def forward(self, y, x):
-        return (self.mse(y.real, x.real) + self.mse(y.imag, x.imag))
-
-def my_init(shape, dtype=None):
-    # old seed 42069
-    tf.random.set_seed(271828)
-    init = tf.keras.initializers.HeNormal(seed=271828)
-    
-    ch_out, ch_in, kx, ky = shape
-    return torch.view_as_complex(torch.from_numpy(init((kx, ky, ch_in, ch_out, 2), np.float32).numpy())).permute((3, 2, 0,1))
 
 def calculate_center_mask(shape, center_fraction):
     mask = np.zeros(shape, dtype=np.float32)
@@ -96,26 +93,23 @@ if __name__ == "__main__":
     tf.random.set_seed(271828)
     torch.manual_seed(271828)
 
-
-    layer = torch.nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(3,3), padding=1, dtype=torch.complex64)
-    layer.weight.data = my_init(layer.weight.shape, dtype=layer.weight.dtype)
-    layer.bias.data = torch.zeros(layer.bias.shape, dtype=layer.weight.dtype)
-
     data = np.load('./mri_sample.npz')
     kspace = data['kspace']
     csm = data['csm']
-    target = torch.from_numpy(data['target'])
+    target = np.abs(data['target'])
     mask = get_offset_sampling_mask(4, kspace.shape, 0.08)
 
     adjoint = np.squeeze(csm_reduce(torch.from_numpy(kspace*mask).unsqueeze(0), torch.from_numpy(csm).unsqueeze(0))).unsqueeze(0).unsqueeze(0).to(torch.complex64).numpy()
 
-    predict = layer(torch.from_numpy(adjoint))
-    cropped_predict = batch_crop_center(predict, 320, 320).squeeze()
-    loss = ComplexMSELoss()
-    loss_val = loss(cropped_predict, target)
-    loss_val.backward()
-    
-    print(loss_val)
-    for n, p in layer.named_parameters():
-        if(p.requires_grad) :
-            print(p.grad.shape, p.grad.abs().mean())
+    inputs = [tf.convert_to_tensor(np.abs(adjoint))]
+    model = UnrolledNetwork()
+    # model = model.build((1, 1, 1, 640, 368))
+    with tf.GradientTape() as g:
+        [g.watch(x) for x in inputs]
+        output = model(inputs)
+        # output = 
+        loss = tf.reduce_mean(tf.keras.losses.mean_squared_error(tf.transpose(target[np.newaxis, np.newaxis, ...], perm=(0, 2, 3, 1)), tf.transpose(output, perm=(0, 2, 3, 1))))
+        print('LOSS: ', loss)
+
+    gradients = g.gradient(loss, model.trainable_variables)
+    [print(g.shape, tf.reduce_mean(tf.abs(g))) for g in gradients]

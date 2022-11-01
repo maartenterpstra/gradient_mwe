@@ -7,7 +7,7 @@ import tensorflow
 import tensorflow as tf
 import tensorflow.keras.backend as K
 K.set_image_data_format('channels_first')
-
+import torch.nn.functional as F
 gpus = tf.config.experimental.list_physical_devices('GPU')
 for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True)
@@ -36,21 +36,14 @@ def csm_reduce(x, csm):
     ifft2c = IFFT2c()
     return (ifft2c(x) * torch.conj(csm)).sum(1, keepdims=True)
 
-class ComplexMSELoss(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.mse = torch.nn.MSELoss()
-        
-    def forward(self, y, x):
-        return (self.mse(y.real, x.real) + self.mse(y.imag, x.imag))
-
 def my_init(shape, dtype=None):
     # old seed 42069
     tf.random.set_seed(271828)
     init = tf.keras.initializers.HeNormal(seed=271828)
     
     ch_out, ch_in, kx, ky = shape
-    return torch.view_as_complex(torch.from_numpy(init((kx, ky, ch_in, ch_out, 2), np.float32).numpy())).permute((3, 2, 0,1))
+    return torch.from_numpy(init((kx, ky, ch_in, ch_out)).numpy()).permute((3, 2, 0, 1))
+    # return torch.view_as_complex(torch.from_numpy(init((kx, ky, ch_in, ch_out, 2), np.float32).numpy())).permute((3, 2, 0,1))
 
 def calculate_center_mask(shape, center_fraction):
     mask = np.zeros(shape, dtype=np.float32)
@@ -97,22 +90,22 @@ if __name__ == "__main__":
     torch.manual_seed(271828)
 
 
-    layer = torch.nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(3,3), padding=1, dtype=torch.complex64)
+    layer = torch.nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(3,3), padding=1, dtype=torch.float32)
     layer.weight.data = my_init(layer.weight.shape, dtype=layer.weight.dtype)
     layer.bias.data = torch.zeros(layer.bias.shape, dtype=layer.weight.dtype)
 
     data = np.load('./mri_sample.npz')
     kspace = data['kspace']
     csm = data['csm']
-    target = torch.from_numpy(data['target'])
+    target = torch.from_numpy(data['target']).abs()
     mask = get_offset_sampling_mask(4, kspace.shape, 0.08)
 
     adjoint = np.squeeze(csm_reduce(torch.from_numpy(kspace*mask).unsqueeze(0), torch.from_numpy(csm).unsqueeze(0))).unsqueeze(0).unsqueeze(0).to(torch.complex64).numpy()
 
-    predict = layer(torch.from_numpy(adjoint))
+    predict = layer(torch.from_numpy(adjoint).abs())
     cropped_predict = batch_crop_center(predict, 320, 320).squeeze()
-    loss = ComplexMSELoss()
-    loss_val = loss(cropped_predict, target)
+    # loss = ComplexMSELoss()
+    loss_val = F.mse_loss(cropped_predict, target)
     loss_val.backward()
     
     print(loss_val)
